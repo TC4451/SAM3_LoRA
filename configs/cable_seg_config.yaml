@@ -1,0 +1,37 @@
+# configs/cable_seg_config.yaml
+
+lora:
+  rank: 16                        # Sweet spot for 20K images
+  alpha: 32                       # 2× rank (standard)
+  dropout: 0.05                   # Light — 20K images is plenty of data
+  target_modules:
+    - "q_proj"                    # Query projection
+    - "k_proj"                    # Key projection
+    - "v_proj"                    # Value projection
+    # Intentionally skip fc1/fc2 to keep parameter count low and training stable
+
+  # Component selection:
+  apply_to_vision_encoder: true   # CRITICAL for thin cables — adapts ViT features
+  apply_to_mask_decoder: true     # CRITICAL for mask boundary quality
+  apply_to_geometry_encoder: false    # ← add this line
+  apply_to_detr_encoder: false    # Not needed for single-category
+  apply_to_detr_decoder: false    # Not needed for single-category
+  apply_to_text_encoder: false    # "cable" is already well-understood by CLIP
+
+training:
+  data_dir: "../data/synthetic_wire"       # Contains train/ and valid/ subdirectories
+  batch_size: 2                   # Stable gradient estimates
+  num_epochs: 3                  # 20K images — converges faster than small datasets
+  learning_rate: 1e-5             # Conservative, stable
+  weight_decay: 0.01
+  gradient_accumulation_steps: 8  # Effective batch size = 16
+  num_workers: 4
+
+output:
+  output_dir: "outputs/cable_lora_5"
+  save_config_each_run: true
+  config_snapshot_name: "config_{run_id}.yaml"  # Also supports {config_name}, {config_stem}
+  save_every_epoch: true
+  epoch_ckpt_subdir: "epochs"
+  epoch_ckpt_name: "epoch_{epoch:03d}_lora_weights.pt"
+  keep_last_n_epoch_ckpts: 0   # 0 = keep all

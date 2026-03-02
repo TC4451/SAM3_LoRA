@@ -1,0 +1,33 @@
+# configs/cable_vision_only.yaml
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules:
+    - "qkv"
+    - "proj"
+    - "fc1"
+    - "fc2"
+  apply_to_vision_encoder: true
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: false
+  apply_to_detr_decoder: false
+  apply_to_mask_decoder: false
+
+training:
+  data_dir: "../data/synthetic_wire"
+  batch_size: 4
+  num_epochs: 5
+  learning_rate: 5e-5
+  weight_decay: 0.01
+  num_workers: 8
+
+output:
+  output_dir: "outputs/cable_lora_6"
+  save_config_each_run: true
+  config_snapshot_name: "config_{run_id}.yaml"  # Also supports {config_name}, {config_stem}
+  save_every_epoch: true
+  epoch_ckpt_subdir: "epochs"
+  epoch_ckpt_name: "epoch_{epoch:03d}_lora_weights.pt"
+  keep_last_n_epoch_ckpts: 0   # 0 = keep all

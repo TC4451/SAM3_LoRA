@@ -25,6 +25,8 @@ import os
 import argparse
 import yaml
 import json
+import time
+import shutil
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -107,6 +109,45 @@ def print_rank0(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def format_duration(seconds: float) -> str:
+    """Format duration in HH:MM:SS."""
+    total_seconds = max(0, int(seconds))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+_CUDA_TOTAL_MEM_GB_CACHE = {}
+
+
+def get_cuda_memory_stats(device: torch.device) -> dict:
+    """Get CUDA memory stats in GB for the specified device."""
+    stats = {
+        "gpu_mem_alloc_gb": 0.0,
+        "gpu_mem_reserved_gb": 0.0,
+        "gpu_mem_max_alloc_gb": 0.0,
+        "gpu_mem_max_reserved_gb": 0.0,
+        "gpu_mem_total_gb": 0.0,
+    }
+    if not torch.cuda.is_available():
+        return stats
+    if device.type != "cuda":
+        return stats
+
+    device_idx = device.index if device.index is not None else torch.cuda.current_device()
+    bytes_to_gb = 1024 ** 3
+    if device_idx not in _CUDA_TOTAL_MEM_GB_CACHE:
+        props = torch.cuda.get_device_properties(device_idx)
+        _CUDA_TOTAL_MEM_GB_CACHE[device_idx] = props.total_memory / bytes_to_gb
+    stats["gpu_mem_alloc_gb"] = torch.cuda.memory_allocated(device_idx) / bytes_to_gb
+    stats["gpu_mem_reserved_gb"] = torch.cuda.memory_reserved(device_idx) / bytes_to_gb
+    stats["gpu_mem_max_alloc_gb"] = torch.cuda.max_memory_allocated(device_idx) / bytes_to_gb
+    stats["gpu_mem_max_reserved_gb"] = torch.cuda.max_memory_reserved(device_idx) / bytes_to_gb
+    stats["gpu_mem_total_gb"] = _CUDA_TOTAL_MEM_GB_CACHE[device_idx]
+    return stats
+
+
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data"""
     def __init__(self, data_dir, split="train"):
@@ -117,10 +158,12 @@ class COCOSegmentDataset(Dataset):
         """
         self.data_dir = Path(data_dir)
         self.split = split
-        self.split_dir = self.data_dir / split
+        # self.split_dir = self.data_dir / split
+        self.split_dir = self.data_dir
 
         # Load COCO annotations
-        ann_file = self.split_dir / "_annotations.coco.json"
+        # ann_file = self.split_dir / "_annotations.coco.json"
+        ann_file = self.data_dir / f"{split}.json"
         if not ann_file.exists():
             raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
 
@@ -763,7 +806,8 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
 
 class SAM3TrainerNative:
     def __init__(self, config_path, multi_gpu=False):
-        with open(config_path, "r") as f:
+        self.config_path = Path(config_path).resolve()
+        with open(self.config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
         # Multi-GPU setup
@@ -971,6 +1015,10 @@ class SAM3TrainerNative:
         epochs = self.config["training"]["num_epochs"]
         best_val_loss = float('inf')
         print_rank0(f"Starting training for {epochs} epochs...")
+        log_every_n_steps = int(self.config["training"].get("log_every_n_steps", 50))
+        if log_every_n_steps <= 0:
+            log_every_n_steps = 50
+        print_metrics_to_console = bool(self.config["training"].get("print_metrics_to_console", False))
 
         if has_validation:
             print_rank0(f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}")
@@ -999,20 +1047,156 @@ class SAM3TrainerNative:
             return obj
 
         # Create output directory
-        out_dir = Path(self.config["output"]["output_dir"])
+        output_cfg = self.config["output"]
+        out_dir = Path(output_cfg["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
+        log_path = out_dir / "training_metrics.jsonl"
+        global_batch_size = self.config["training"]["batch_size"] * (self.world_size if self.multi_gpu else 1)
 
+        # Optional config snapshot for reproducibility (one per run)
+        save_config_each_run = bool(output_cfg.get("save_config_each_run", True))
+        config_snapshot_name_template = str(
+            output_cfg.get("config_snapshot_name", "config_{run_id}.yaml")
+        )
+        run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+        config_snapshot_path = None
+        if is_main_process() and save_config_each_run:
+            try:
+                config_snapshot_name = config_snapshot_name_template.format(
+                    run_id=run_id,
+                    config_name=self.config_path.name,
+                    config_stem=self.config_path.stem,
+                )
+            except Exception as e:
+                print_rank0(
+                    f"Warning: Invalid config snapshot template '{config_snapshot_name_template}': {e}. "
+                    "Falling back to default template."
+                )
+                config_snapshot_name = f"config_{run_id}.yaml"
+
+            config_snapshot_path = out_dir / config_snapshot_name
+            config_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.config_path.exists():
+                shutil.copy2(self.config_path, config_snapshot_path)
+            else:
+                with open(config_snapshot_path, "w") as f:
+                    yaml.safe_dump(self.config, f, sort_keys=False)
+            print_rank0(f"Saved run config snapshot: {config_snapshot_path}")
+
+        # Optional per-epoch checkpointing (in addition to best/last checkpoints)
+        save_every_epoch = bool(output_cfg.get("save_every_epoch", False))
+        epoch_ckpt_subdir = output_cfg.get("epoch_ckpt_subdir", "")
+        epoch_ckpt_name_template = str(
+            output_cfg.get("epoch_ckpt_name", "epoch_{epoch:03d}_lora_weights.pt")
+        )
+        try:
+            keep_last_n_epoch_ckpts = int(output_cfg.get("keep_last_n_epoch_ckpts", 0))
+        except (TypeError, ValueError):
+            keep_last_n_epoch_ckpts = 0
+        keep_last_n_epoch_ckpts = max(0, keep_last_n_epoch_ckpts)
+
+        epoch_ckpt_dir = out_dir / epoch_ckpt_subdir if epoch_ckpt_subdir else out_dir
+        if save_every_epoch:
+            epoch_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_epoch_ckpt_paths = []
+        epoch_ckpt_template_error_logged = False
+
+        try:
+            epoch_ckpt_dir_display = str(epoch_ckpt_dir.relative_to(out_dir))
+        except ValueError:
+            epoch_ckpt_dir_display = str(epoch_ckpt_dir)
+        if epoch_ckpt_dir_display in ("", "."):
+            epoch_ckpt_target_display = epoch_ckpt_name_template
+        else:
+            epoch_ckpt_target_display = f"{epoch_ckpt_dir_display}/{epoch_ckpt_name_template}"
+
+        def save_per_epoch_checkpoint(model_to_save, epoch_num: int):
+            nonlocal epoch_ckpt_template_error_logged
+            if not save_every_epoch:
+                return
+
+            try:
+                ckpt_name = epoch_ckpt_name_template.format(epoch=epoch_num)
+            except Exception as e:
+                if not epoch_ckpt_template_error_logged:
+                    print_rank0(
+                        f"Warning: Invalid epoch checkpoint name template '{epoch_ckpt_name_template}': {e}. "
+                        "Falling back to default template."
+                    )
+                    epoch_ckpt_template_error_logged = True
+                ckpt_name = f"epoch_{epoch_num:03d}_lora_weights.pt"
+
+            epoch_ckpt_path = epoch_ckpt_dir / ckpt_name
+            epoch_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            save_lora_weights(model_to_save, str(epoch_ckpt_path))
+            if len(saved_epoch_ckpt_paths) == 0 or saved_epoch_ckpt_paths[-1] != epoch_ckpt_path:
+                saved_epoch_ckpt_paths.append(epoch_ckpt_path)
+
+            if keep_last_n_epoch_ckpts > 0:
+                while len(saved_epoch_ckpt_paths) > keep_last_n_epoch_ckpts:
+                    old_path = saved_epoch_ckpt_paths.pop(0)
+                    if old_path.exists():
+                        old_path.unlink()
+
+        def log_metrics(record: dict):
+            if not is_main_process():
+                return
+            with open(log_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
+        if is_main_process():
+            run_meta = {
+                "event": "run_start",
+                "time": time.time(),
+                "run_id": run_id,
+                "epochs": epochs,
+                "train_samples": len(train_ds),
+                "val_samples": len(val_ds) if has_validation and val_ds is not None else 0,
+                "batch_size_per_gpu": self.config["training"]["batch_size"],
+                "world_size": self.world_size,
+                "global_batch_size": global_batch_size,
+                "log_every_n_steps": log_every_n_steps,
+                "config_path": str(self.config_path),
+            }
+            if config_snapshot_path is not None:
+                run_meta["config_snapshot_path"] = str(config_snapshot_path)
+            if torch.cuda.is_available() and self.device.type == "cuda":
+                device_idx = self.device.index if self.device.index is not None else torch.cuda.current_device()
+                props = torch.cuda.get_device_properties(device_idx)
+                run_meta["gpu_name"] = props.name
+                run_meta["gpu_total_mem_gb"] = round(props.total_memory / (1024 ** 3), 2)
+                if print_metrics_to_console:
+                    print_rank0(
+                        f"Logging every {log_every_n_steps} steps | GPU: {props.name} "
+                        f"({run_meta['gpu_total_mem_gb']:.2f} GB)"
+                    )
+            elif print_metrics_to_console:
+                print_rank0(f"Logging every {log_every_n_steps} steps")
+            if print_metrics_to_console:
+                print_rank0(f"Detailed metrics log: {log_path}")
+            log_metrics(run_meta)
+
+        run_start_time = time.time()
         for epoch in range(epochs):
             # Set epoch for distributed sampler (required for proper shuffling)
             if self.multi_gpu and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
+            if torch.cuda.is_available() and self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
 
             # Track training losses for this epoch
             train_losses = []
+            train_loss_sum = 0.0
+            epoch_start_time = time.time()
+            last_iter_end_time = epoch_start_time
 
             # Only show progress bar on rank 0
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
-            for batch_dict in pbar:
+            num_train_batches = len(train_loader)
+            for step_idx, batch_dict in enumerate(pbar, start=1):
+                iter_start_time = time.time()
+                data_wait_time = iter_start_time - last_iter_end_time
                 input_batch = batch_dict["input"]
 
                 # Move to device
@@ -1062,8 +1246,55 @@ class SAM3TrainerNative:
                 self.optimizer.step()
 
                 # Track training loss
-                train_losses.append(total_loss.item())
-                pbar.set_postfix({"loss": total_loss.item()})
+                step_loss = total_loss.item()
+                train_losses.append(step_loss)
+                train_loss_sum += step_loss
+                running_train_loss = train_loss_sum / step_idx
+                iter_time = time.time() - iter_start_time
+                epoch_elapsed = time.time() - epoch_start_time
+                progress = step_idx / max(1, num_train_batches)
+                eta_seconds = (epoch_elapsed / step_idx) * max(0, num_train_batches - step_idx)
+                samples_per_second = (step_idx * global_batch_size) / max(epoch_elapsed, 1e-6)
+
+                gpu_stats = get_cuda_memory_stats(self.device)
+                pbar.set_postfix({
+                    "loss": f"{step_loss:.3f}",
+                    "avg": f"{running_train_loss:.3f}",
+                    "it_s": f"{iter_time:.2f}",
+                    "gpu_gb": f"{gpu_stats['gpu_mem_alloc_gb']:.1f}",
+                })
+
+                if is_main_process() and (
+                    step_idx == 1 or
+                    step_idx % log_every_n_steps == 0 or
+                    step_idx == num_train_batches
+                ):
+                    if print_metrics_to_console:
+                        print_rank0(
+                            f"[Train] epoch {epoch+1}/{epochs} step {step_idx}/{num_train_batches} "
+                            f"({progress * 100:.1f}%) loss={step_loss:.6f} avg_loss={running_train_loss:.6f} "
+                            f"iter={iter_time:.2f}s data_wait={data_wait_time:.2f}s "
+                            f"samples/s={samples_per_second:.2f} eta={format_duration(eta_seconds)} "
+                            f"gpu_alloc={gpu_stats['gpu_mem_alloc_gb']:.2f}GB "
+                            f"gpu_reserved={gpu_stats['gpu_mem_reserved_gb']:.2f}GB"
+                        )
+                    log_metrics({
+                        "event": "train_step",
+                        "time": time.time(),
+                        "epoch": epoch + 1,
+                        "step": step_idx,
+                        "steps_per_epoch": num_train_batches,
+                        "progress_pct": round(progress * 100, 2),
+                        "loss": step_loss,
+                        "running_loss": running_train_loss,
+                        "iter_time_sec": iter_time,
+                        "data_wait_sec": data_wait_time,
+                        "epoch_elapsed_sec": epoch_elapsed,
+                        "eta_sec": eta_seconds,
+                        "samples_per_second": samples_per_second,
+                        **gpu_stats,
+                    })
+                last_iter_end_time = time.time()
 
             # Calculate average training loss for this epoch
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
@@ -1072,11 +1303,15 @@ class SAM3TrainerNative:
             if has_validation and val_loader is not None:
                 self.model.eval()
                 val_losses = []
+                val_loss_sum = 0.0
+                val_start_time = time.time()
+                num_val_batches = len(val_loader)
 
                 with torch.no_grad():
                     val_pbar = tqdm(val_loader, desc=f"Validation", disable=not is_main_process())
 
-                    for batch_dict in val_pbar:
+                    for val_step_idx, batch_dict in enumerate(val_pbar, start=1):
+                        val_iter_start_time = time.time()
                         input_batch = batch_dict["input"]
                         input_batch = move_to_device(input_batch, self.device)
 
@@ -1108,8 +1343,50 @@ class SAM3TrainerNative:
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
                         total_loss = loss_dict[CORE_LOSS_KEY]
 
-                        val_losses.append(total_loss.item())
-                        val_pbar.set_postfix({"val_loss": total_loss.item()})
+                        val_step_loss = total_loss.item()
+                        val_losses.append(val_step_loss)
+                        val_loss_sum += val_step_loss
+                        running_val_loss = val_loss_sum / val_step_idx
+                        val_iter_time = time.time() - val_iter_start_time
+                        val_elapsed = time.time() - val_start_time
+                        val_progress = val_step_idx / max(1, num_val_batches)
+                        val_eta_seconds = (val_elapsed / val_step_idx) * max(0, num_val_batches - val_step_idx)
+                        gpu_stats = get_cuda_memory_stats(self.device)
+                        val_pbar.set_postfix({
+                            "val_loss": f"{val_step_loss:.3f}",
+                            "avg": f"{running_val_loss:.3f}",
+                            "it_s": f"{val_iter_time:.2f}",
+                            "gpu_gb": f"{gpu_stats['gpu_mem_alloc_gb']:.1f}",
+                        })
+
+                        if is_main_process() and (
+                            val_step_idx == 1 or
+                            val_step_idx % log_every_n_steps == 0 or
+                            val_step_idx == num_val_batches
+                        ):
+                            if print_metrics_to_console:
+                                print_rank0(
+                                    f"[Valid] epoch {epoch+1}/{epochs} step {val_step_idx}/{num_val_batches} "
+                                    f"({val_progress * 100:.1f}%) val_loss={val_step_loss:.6f} "
+                                    f"avg_val_loss={running_val_loss:.6f} iter={val_iter_time:.2f}s "
+                                    f"eta={format_duration(val_eta_seconds)} "
+                                    f"gpu_alloc={gpu_stats['gpu_mem_alloc_gb']:.2f}GB "
+                                    f"gpu_reserved={gpu_stats['gpu_mem_reserved_gb']:.2f}GB"
+                                )
+                            log_metrics({
+                                "event": "val_step",
+                                "time": time.time(),
+                                "epoch": epoch + 1,
+                                "step": val_step_idx,
+                                "steps_per_epoch": num_val_batches,
+                                "progress_pct": round(val_progress * 100, 2),
+                                "val_loss": val_step_loss,
+                                "running_val_loss": running_val_loss,
+                                "iter_time_sec": val_iter_time,
+                                "epoch_elapsed_sec": val_elapsed,
+                                "eta_sec": val_eta_seconds,
+                                **gpu_stats,
+                            })
 
                 avg_val_loss = sum(val_losses) / len(val_losses)
 
@@ -1120,12 +1397,35 @@ class SAM3TrainerNative:
                     avg_val_loss = val_loss_tensor.item()
 
                 print_rank0(f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+                if is_main_process():
+                    epoch_time = time.time() - epoch_start_time
+                    run_elapsed = time.time() - run_start_time
+                    gpu_stats = get_cuda_memory_stats(self.device)
+                    if print_metrics_to_console:
+                        print_rank0(
+                            f"[EpochSummary] epoch {epoch+1}/{epochs} train_loss={avg_train_loss:.6f} "
+                            f"val_loss={avg_val_loss:.6f} epoch_time={format_duration(epoch_time)} "
+                            f"run_elapsed={format_duration(run_elapsed)} "
+                            f"gpu_max_alloc={gpu_stats['gpu_mem_max_alloc_gb']:.2f}GB "
+                            f"gpu_max_reserved={gpu_stats['gpu_mem_max_reserved_gb']:.2f}GB"
+                        )
+                    log_metrics({
+                        "event": "epoch_summary",
+                        "time": time.time(),
+                        "epoch": epoch + 1,
+                        "train_loss": avg_train_loss,
+                        "val_loss": avg_val_loss,
+                        "epoch_time_sec": epoch_time,
+                        "run_elapsed_sec": run_elapsed,
+                        **gpu_stats,
+                    })
 
                 # Save models based on validation loss (only on rank 0)
                 if is_main_process():
                     # Get underlying model from DDP wrapper
                     model_to_save = self.model.module if self.multi_gpu else self.model
                     save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+                    save_per_epoch_checkpoint(model_to_save, epoch + 1)
 
                     if avg_val_loss < best_val_loss:
                         best_val_loss = avg_val_loss
@@ -1147,8 +1447,28 @@ class SAM3TrainerNative:
             else:
                 # No validation - just save model each epoch (only on rank 0)
                 if is_main_process():
+                    epoch_time = time.time() - epoch_start_time
+                    run_elapsed = time.time() - run_start_time
+                    gpu_stats = get_cuda_memory_stats(self.device)
+                    if print_metrics_to_console:
+                        print_rank0(
+                            f"[EpochSummary] epoch {epoch+1}/{epochs} train_loss={avg_train_loss:.6f} "
+                            f"epoch_time={format_duration(epoch_time)} run_elapsed={format_duration(run_elapsed)} "
+                            f"gpu_max_alloc={gpu_stats['gpu_mem_max_alloc_gb']:.2f}GB "
+                            f"gpu_max_reserved={gpu_stats['gpu_mem_max_reserved_gb']:.2f}GB"
+                        )
+                    log_metrics({
+                        "event": "epoch_summary",
+                        "time": time.time(),
+                        "epoch": epoch + 1,
+                        "train_loss": avg_train_loss,
+                        "epoch_time_sec": epoch_time,
+                        "run_elapsed_sec": run_elapsed,
+                        **gpu_stats,
+                    })
                     model_to_save = self.model.module if self.multi_gpu else self.model
                     save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+                    save_per_epoch_checkpoint(model_to_save, epoch + 1)
 
         # Synchronize before final save
         if self.multi_gpu:
@@ -1164,6 +1484,8 @@ class SAM3TrainerNative:
                 print(f"\nModels saved to {out_dir}:")
                 print(f"  - best_lora_weights.pt (best validation loss)")
                 print(f"  - last_lora_weights.pt (last epoch)")
+                if save_every_epoch:
+                    print(f"  - {epoch_ckpt_target_display} (one file per epoch)")
                 print(f"\n📊 To compute full metrics (mAP, cgF1) with NMS:")
                 print(f"   python validate_sam3_lora.py \\")
                 print(f"     --config <config_path> \\")
@@ -1172,7 +1494,6 @@ class SAM3TrainerNative:
                 print(f"{'='*80}")
             else:
                 # If no validation, copy last to best
-                import shutil
                 last_path = out_dir / "last_lora_weights.pt"
                 best_path = out_dir / "best_lora_weights.pt"
                 if last_path.exists():
@@ -1184,6 +1505,8 @@ class SAM3TrainerNative:
                 print(f"\nModels saved to {out_dir}:")
                 print(f"  - best_lora_weights.pt (copy of last epoch)")
                 print(f"  - last_lora_weights.pt (last epoch)")
+                if save_every_epoch:
+                    print(f"  - {epoch_ckpt_target_display} (one file per epoch)")
                 print(f"\nℹ️  No validation data - consider adding data/valid/ for better model selection")
                 print(f"{'='*80}")
 
