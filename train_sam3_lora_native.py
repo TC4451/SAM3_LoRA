@@ -51,7 +51,7 @@ from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
 from sam3.model.box_ops import box_xywh_to_xyxy
-from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
+from lora_layers import LoRAConfig, LoRALayer, apply_lora_to_model, save_lora_weights, count_parameters
 
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
@@ -805,10 +805,12 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
 
 
 class SAM3TrainerNative:
-    def __init__(self, config_path, multi_gpu=False):
+    def __init__(self, config_path, multi_gpu=False, resume_checkpoint=None, auto_resume=False):
         self.config_path = Path(config_path).resolve()
         with open(self.config_path, "r") as f:
             self.config = yaml.safe_load(f)
+        self.resume_checkpoint = Path(resume_checkpoint).expanduser() if resume_checkpoint else None
+        self.auto_resume = auto_resume
 
         # Multi-GPU setup
         self.multi_gpu = multi_gpu
@@ -927,7 +929,107 @@ class SAM3TrainerNative:
             normalization="local",  # Use local normalization (no distributed training)
             normalize_by_valid_object_num=False,
         )
-        
+
+    def _extract_lora_state_dict(self, model: nn.Module):
+        """Extract only LoRA weights from a model."""
+        lora_state_dict = {}
+        for name, module in model.named_modules():
+            if isinstance(module, LoRALayer):
+                lora_state_dict[f"{name}.lora_A"] = module.lora_A.detach().cpu()
+                lora_state_dict[f"{name}.lora_B"] = module.lora_B.detach().cpu()
+        return lora_state_dict
+
+    def _move_optimizer_state_to_device(self):
+        """Move optimizer state tensors to the current training device."""
+        for state in self.optimizer.state.values():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(self.device)
+
+    def _resolve_resume_checkpoint(self, out_dir: Path, output_cfg: dict):
+        """Resolve which checkpoint to use for resume, if any."""
+        resume_from_cfg = (
+            self.config.get("training", {}).get("resume_from")
+            or output_cfg.get("resume_from")
+        )
+        explicit_resume_requested = self.resume_checkpoint is not None or bool(resume_from_cfg)
+        resume_path = self.resume_checkpoint or (
+            Path(resume_from_cfg).expanduser() if resume_from_cfg else None
+        )
+
+        if resume_path is not None:
+            if not resume_path.is_absolute():
+                resume_path = (self.config_path.parent / resume_path).resolve()
+            if resume_path.exists():
+                return resume_path
+            if explicit_resume_requested:
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+            return None
+
+        auto_resume_enabled = bool(output_cfg.get("auto_resume", False)) or self.auto_resume
+        if not auto_resume_enabled:
+            return None
+
+        resume_name = str(output_cfg.get("resume_checkpoint_name", "last_training_state.pt"))
+        auto_path = out_dir / resume_name
+        return auto_path if auto_path.exists() else None
+
+    def _load_resume_checkpoint(self, checkpoint_path: Path):
+        """
+        Load resume checkpoint.
+        Returns (start_epoch, best_val_loss, resumed_full_state).
+        """
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        # Full training-state checkpoint
+        if (
+            isinstance(checkpoint, dict)
+            and "optimizer_state_dict" in checkpoint
+            and "lora_state_dict" in checkpoint
+        ):
+            self._unwrapped_model.load_state_dict(checkpoint["lora_state_dict"], strict=False)
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            self._move_optimizer_state_to_device()
+            start_epoch = int(checkpoint.get("epoch", 0))
+            best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+            return start_epoch, best_val_loss, True
+
+        # Fallback: LoRA-only weights file (no optimizer/epoch state)
+        is_lora_only = (
+            isinstance(checkpoint, dict)
+            and len(checkpoint) > 0
+            and all(k.endswith(".lora_A") or k.endswith(".lora_B") for k in checkpoint.keys())
+        )
+        if is_lora_only:
+            self._unwrapped_model.load_state_dict(checkpoint, strict=False)
+            return 0, float("inf"), False
+
+        raise ValueError(
+            f"Unsupported checkpoint format: {checkpoint_path}. "
+            "Expected a full training state checkpoint or LoRA-only weights."
+        )
+
+    def _save_resume_checkpoint(
+        self,
+        checkpoint_path: Path,
+        model_to_save: nn.Module,
+        epoch_num: int,
+        best_val_loss: float,
+    ):
+        """Save full training state for resume (atomic write)."""
+        checkpoint = {
+            "epoch": int(epoch_num),
+            "best_val_loss": float(best_val_loss),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "lora_state_dict": self._extract_lora_state_dict(model_to_save),
+            "config_path": str(self.config_path),
+            "time": time.time(),
+        }
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, checkpoint_path)
+
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
@@ -1013,8 +1115,8 @@ class SAM3TrainerNative:
         }
 
         epochs = self.config["training"]["num_epochs"]
+        start_epoch = 0
         best_val_loss = float('inf')
-        print_rank0(f"Starting training for {epochs} epochs...")
         log_every_n_steps = int(self.config["training"].get("log_every_n_steps", 50))
         if log_every_n_steps <= 0:
             log_every_n_steps = 50
@@ -1052,6 +1154,39 @@ class SAM3TrainerNative:
         out_dir.mkdir(parents=True, exist_ok=True)
         log_path = out_dir / "training_metrics.jsonl"
         global_batch_size = self.config["training"]["batch_size"] * (self.world_size if self.multi_gpu else 1)
+        save_resume_checkpoint = bool(output_cfg.get("save_resume_checkpoint", True))
+        resume_checkpoint_name = str(output_cfg.get("resume_checkpoint_name", "last_training_state.pt"))
+        resume_checkpoint_path = out_dir / resume_checkpoint_name
+
+        # Resume support: restore LoRA weights + optimizer + epoch from full checkpoint.
+        resume_path = self._resolve_resume_checkpoint(out_dir, output_cfg)
+        resumed_full_state = False
+        if resume_path is not None:
+            loaded_start_epoch, loaded_best_val, resumed_full_state = self._load_resume_checkpoint(resume_path)
+            start_epoch = loaded_start_epoch
+            best_val_loss = loaded_best_val
+            if resumed_full_state:
+                print_rank0(
+                    f"Resumed full training state from: {resume_path} "
+                    f"(next epoch: {start_epoch + 1}, best_val_loss: {best_val_loss:.6f})"
+                )
+            else:
+                print_rank0(
+                    f"Loaded LoRA weights from resume path: {resume_path} "
+                    "(optimizer/epoch state not found; training starts at epoch 1)."
+                )
+
+        print_rank0(f"Starting training for {epochs} epochs...")
+        if start_epoch > 0:
+            print_rank0(f"Continuing from epoch {start_epoch + 1}/{epochs}")
+        if start_epoch >= epochs:
+            print_rank0(
+                f"Resume epoch ({start_epoch}) is already >= configured num_epochs ({epochs}). "
+                "Nothing to train."
+            )
+            if self.multi_gpu:
+                cleanup_distributed()
+            return
 
         # Optional config snapshot for reproducibility (one per run)
         save_config_each_run = bool(output_cfg.get("save_config_each_run", True))
@@ -1151,6 +1286,9 @@ class SAM3TrainerNative:
                 "time": time.time(),
                 "run_id": run_id,
                 "epochs": epochs,
+                "start_epoch": start_epoch,
+                "resumed_full_state": resumed_full_state,
+                "resume_checkpoint_path": str(resume_path) if resume_path is not None else None,
                 "train_samples": len(train_ds),
                 "val_samples": len(val_ds) if has_validation and val_ds is not None else 0,
                 "batch_size_per_gpu": self.config["training"]["batch_size"],
@@ -1158,6 +1296,8 @@ class SAM3TrainerNative:
                 "global_batch_size": global_batch_size,
                 "log_every_n_steps": log_every_n_steps,
                 "config_path": str(self.config_path),
+                "save_resume_checkpoint": save_resume_checkpoint,
+                "resume_checkpoint_name": resume_checkpoint_name,
             }
             if config_snapshot_path is not None:
                 run_meta["config_snapshot_path"] = str(config_snapshot_path)
@@ -1178,7 +1318,7 @@ class SAM3TrainerNative:
             log_metrics(run_meta)
 
         run_start_time = time.time()
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             # Set epoch for distributed sampler (required for proper shuffling)
             if self.multi_gpu and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -1432,6 +1572,14 @@ class SAM3TrainerNative:
                         save_lora_weights(model_to_save, str(out_dir / "best_lora_weights.pt"))
                         print(f"✓ New best model saved (val_loss: {avg_val_loss:.6f})")
 
+                    if save_resume_checkpoint:
+                        self._save_resume_checkpoint(
+                            checkpoint_path=resume_checkpoint_path,
+                            model_to_save=model_to_save,
+                            epoch_num=epoch + 1,
+                            best_val_loss=best_val_loss,
+                        )
+
                     # Log to file
                     with open(out_dir / "val_stats.json", "a") as f:
                         f.write(json.dumps({
@@ -1469,6 +1617,13 @@ class SAM3TrainerNative:
                     model_to_save = self.model.module if self.multi_gpu else self.model
                     save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
                     save_per_epoch_checkpoint(model_to_save, epoch + 1)
+                    if save_resume_checkpoint:
+                        self._save_resume_checkpoint(
+                            checkpoint_path=resume_checkpoint_path,
+                            model_to_save=model_to_save,
+                            epoch_num=epoch + 1,
+                            best_val_loss=best_val_loss,
+                        )
 
         # Synchronize before final save
         if self.multi_gpu:
@@ -1484,6 +1639,8 @@ class SAM3TrainerNative:
                 print(f"\nModels saved to {out_dir}:")
                 print(f"  - best_lora_weights.pt (best validation loss)")
                 print(f"  - last_lora_weights.pt (last epoch)")
+                if save_resume_checkpoint:
+                    print(f"  - {resume_checkpoint_name} (full training resume state)")
                 if save_every_epoch:
                     print(f"  - {epoch_ckpt_target_display} (one file per epoch)")
                 print(f"\n📊 To compute full metrics (mAP, cgF1) with NMS:")
@@ -1505,6 +1662,8 @@ class SAM3TrainerNative:
                 print(f"\nModels saved to {out_dir}:")
                 print(f"  - best_lora_weights.pt (copy of last epoch)")
                 print(f"  - last_lora_weights.pt (last epoch)")
+                if save_resume_checkpoint:
+                    print(f"  - {resume_checkpoint_name} (full training resume state)")
                 if save_every_epoch:
                     print(f"  - {epoch_ckpt_target_display} (one file per epoch)")
                 print(f"\nℹ️  No validation data - consider adding data/valid/ for better model selection")
@@ -1536,6 +1695,10 @@ def launch_distributed_training(args):
         "--device", *map(str, devices),
         "--_launched_by_torchrun"  # Internal flag to indicate we're in subprocess
     ]
+    if args.resume is not None:
+        cmd.extend(["--resume", args.resume])
+    if args.auto_resume:
+        cmd.append("--auto-resume")
 
     # Set environment variable for visible devices
     env = os.environ.copy()
@@ -1595,6 +1758,17 @@ Examples:
         help="Local rank for distributed training (set automatically by torchrun)"
     )
     parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to full training-state checkpoint to resume (restores LoRA + optimizer + epoch)."
+    )
+    parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help="Automatically resume from output.resume_checkpoint_name in output_dir if it exists."
+    )
+    parser.add_argument(
         "--_launched_by_torchrun",
         action="store_true",
         help=argparse.SUPPRESS  # Hidden argument for internal use
@@ -1617,5 +1791,10 @@ Examples:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device[0])
             print(f"Using single GPU: {args.device[0]}")
 
-        trainer = SAM3TrainerNative(args.config, multi_gpu=multi_gpu)
+        trainer = SAM3TrainerNative(
+            args.config,
+            multi_gpu=multi_gpu,
+            resume_checkpoint=args.resume,
+            auto_resume=args.auto_resume,
+        )
         trainer.train()

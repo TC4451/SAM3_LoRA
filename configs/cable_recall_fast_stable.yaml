@@ -1,0 +1,59 @@
+lora:
+  # Fast + stable defaults (good starting point)
+  rank: 16
+  alpha: 32
+  dropout: 0.10
+
+  # Minimal module set for speed:
+  # - vision backbone (ViT): qkv/proj
+  # - decoder attention blocks: q/k/v/out proj
+  #
+  # NOTE: q_proj/k_proj/v_proj/out_proj would normally also match prompt cross-attn,
+  # but we patch it out in lora_layers.py (see step 0).
+  target_modules:
+    - "qkv"
+    - "proj"
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "out_proj"
+
+  # Apply LoRA only where it helps your failure mode:
+  apply_to_vision_encoder: true
+  apply_to_detr_decoder: true      # improves confidence/recall
+  apply_to_mask_decoder: true      # improves mask completion
+
+  # Keep the rest frozen for speed + stability
+  apply_to_detr_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_text_encoder: false
+
+training:
+  data_dir: "../data/synthetic_wire"
+
+  # SPEED: your log showed ~4.3GB usage at batch_size=2.
+  # Try 8 first; if OOM, drop to 4 then 2.
+  batch_size: 6
+
+  # 10–15 epochs is a good “fast but meaningful” range at ~20K images.
+  # If you still see val improving at the end, go to 20.
+  num_epochs: 10
+
+  # STABILITY: LoRA across multiple components is usually happier at 3e-5 ~ 1e-4.
+  learning_rate: 5e-5
+  weight_decay: 0.01
+
+  # This key may be ignored by the native script (depends on implementation),
+  # but leaving it here is harmless.
+  gradient_accumulation_steps: 1
+
+  num_workers: 24
+
+output:
+  output_dir: "outputs/cable_recall_fast_stable"
+  save_config_each_run: true
+  config_snapshot_name: "config_{run_id}.yaml"  # Also supports {config_name}, {config_stem}
+  save_every_epoch: true
+  epoch_ckpt_subdir: "epochs"
+  epoch_ckpt_name: "epoch_{epoch:03d}_lora_weights.pt"
+  keep_last_n_epoch_ckpts: 0   # 0 = keep all

@@ -373,6 +373,9 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
 
     def should_apply_lora_to_component(module_name: str) -> bool:
         """Check component-level flags to determine if we should apply LoRA."""
+        # Skip prompt-related cross attention entirely
+        if "cross_attend_prompt" in module_name:
+            return False
         if ("vision_encoder" in module_name or "vision_backbone" in module_name) and not config.apply_to_vision_encoder:
             return False
         if ("text_encoder" in module_name or "language_backbone" in module_name) and not config.apply_to_text_encoder:

@@ -1,0 +1,48 @@
+lora:
+  # Smaller rank = faster + usually stable for “confidence/recall” tuning
+  rank: 8
+  alpha: 16
+  dropout: 0.05
+
+  # DETR blocks use standard MHA projections + FFN
+  # (these names are exactly what the repo’s full config documents for transformer encoder/decoder) :contentReference[oaicite:1]{index=1}
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "out_proj"
+    - "linear1"
+    - "linear2"
+
+  # Only tune what matters for confidence/recall quickly
+  apply_to_vision_encoder: false
+  apply_to_mask_decoder: false
+  apply_to_detr_encoder: false
+  apply_to_detr_decoder: true
+  apply_to_geometry_encoder: false
+  apply_to_text_encoder: false
+
+training:
+  data_dir: "../data/synthetic_wire"
+
+  # Push batch size up for throughput (your previous run was ~4–5GB at bs=2)
+  # If you hit OOM, drop to 12 -> 8 -> 4.
+  batch_size: 4
+
+  # Short run for parallel iteration
+  num_epochs: 15
+
+  # Slightly higher LR is usually fine when tuning only a small subset
+  # If you see instability, drop to 5e-5.
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  num_workers: 12
+
+output:
+  output_dir: "outputs/cable_detr_only_fast"
+  save_config_each_run: true
+  config_snapshot_name: "config_{run_id}.yaml"  # Also supports {config_name}, {config_stem}
+  save_every_epoch: true
+  epoch_ckpt_subdir: "epochs"
+  epoch_ckpt_name: "epoch_{epoch:03d}_lora_weights.pt"
+  keep_last_n_epoch_ckpts: 0   # 0 = keep all
